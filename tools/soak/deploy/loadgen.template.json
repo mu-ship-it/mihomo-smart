@@ -1,8 +1,8 @@
 {
   "instances": [],
   "sites": ["zoom.us", "github.com", "slack.com", "google.com", "claude.ai", "api.anthropic.com"],
-  "http_every": "5m",
-  "http_max_body": 16384,
+  "http_every": "8m",
+  "http_max_body": 8192,
   "stun_every": "15m",
   "stun_servers": ["stun.cloudflare.com:3478", "stun.l.google.com:19302"],
   "stun_packets": 50,
