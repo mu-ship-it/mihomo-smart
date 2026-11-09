@@ -1,0 +1,260 @@
+package outboundgroup
+
+// Phase 3 bug-hunt repros. Each test reproduces one ranked finding from
+// docs/SMART-ASSESSMENT.md §10. See knownBug in smart_test.go for the marker contract.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"os"
+	"runtime/pprof"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/component/smart"
+	C "github.com/metacubex/mihomo/constant"
+	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/tunnel/statistic"
+)
+
+func proxyByName(s *Smart, name string) C.Proxy {
+	for _, p := range s.GetProxies(true) {
+		if p.Name() == name {
+			return p
+		}
+	}
+	return nil
+}
+
+// ------------------------------------------------------------------ R2
+
+// R2: a confirmed failure of node b for a target force-closes the target's connections on
+// every node (smart.go:1638 -> closeSameConnection force=true, which ignores proxyName),
+// including a healthy UDP call on node a.
+func TestHuntR2FailureOnOneNodeMustNotCloseOtherNodes(t *testing.T) {
+	a, b := newFakeNode("a"), newFakeNode("b")
+	s := newTestSmart(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// healthy TCP conn and UDP call on a
+	b.tcpFail.Store(true)
+	b.udpFail.Store(true)
+	mt := tcpMeta("zoom.us")
+	ct, err := s.DialContext(ctx, mt)
+	if err != nil || lastNode(ct.Chains()) != "a" {
+		t.Fatalf("setup tcp: %v %v", err, ct)
+	}
+	tt := statistic.NewTCPTracker(ct, statistic.DefaultManager, mt, nil, 0, 0, false)
+	t.Cleanup(func() { _ = tt.Close() })
+	call, _ := openTrackedUDP(t, s, 50100)
+	if lastNode(call.Chains()) != "a" {
+		t.Fatal("setup: call not on a")
+	}
+	// let the async stats of the setup dials settle
+	time.Sleep(100 * time.Millisecond)
+
+	// node b now fails repeatedly for the same target (driven synchronously)
+	pb := proxyByName(s, "b")
+	for i := 0; i < 12; i++ {
+		m := tcpMeta("zoom.us")
+		m.SrcPort = uint16(51000 + i)
+		s.selectProxies(m, s.GetProxies(true))
+		s.recordConnectionStats(m, pb, 30, 0, 0, 0, 0, 0, 0, nil, nil, errors.New("b: connection refused"))
+	}
+
+	a.mu.Lock()
+	tcpClosed := a.tcpConns[0].closed.Load()
+	udpClosed := a.udpConns[0].closed.Load()
+	a.mu.Unlock()
+	knownBug(t, "R2 (forced close not scoped to failing node)", tcpClosed || udpClosed,
+		"node b failing closed node a's healthy connections (tcp closed="+boolStr(tcpClosed)+", udp call closed="+boolStr(udpClosed)+")")
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// ------------------------------------------------------------------ U1
+
+// U1: a node that accepts UDP sessions but never returns a packet (UDP blackhole, the
+// "Zoom on a congested node" failure in its extreme form) is scored as a good node: the
+// session closes without error, latency is 0 and is then treated as 1 ms.
+func TestHuntU1UDPBlackholeMustNotScoreAsHealthy(t *testing.T) {
+	a, b := newFakeNode("a"), newFakeNode("b")
+	b.udpFail.Store(true)
+	s := newTestSmart(t, a, b)
+
+	var target string
+	for i := 0; i < 6; i++ {
+		m := udpMeta("zoom.us", uint16(52000+i))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pc, err := s.ListenPacketContext(ctx, m)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		target = m.SmartTarget
+		tr := statistic.NewUDPTracker(pc, statistic.DefaultManager, m, nil, 0, 0, false)
+		// the client sends media for 10 s and never receives anything back
+		_, _ = tr.WriteTo(bytes.Repeat([]byte{1}, 1200), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
+		tr.Info().Start = time.Now().Add(-10 * time.Second)
+		_ = tr.Close()
+	}
+	time.Sleep(300 * time.Millisecond) // close callbacks record asynchronously
+
+	names, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, target, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy := false
+	for i, n := range names {
+		if n == "a" && i < len(weights) && weights[i] >= smart.AllowedWeight {
+			healthy = true
+		}
+	}
+	knownBug(t, "U1 (UDP blackhole scored healthy)", healthy,
+		"node a never answered 6 UDP sessions yet is ranked "+strings.Join(names, ",")+" with weight >= AllowedWeight")
+}
+
+// ------------------------------------------------------------------ R1
+
+// R1: closeSameConnection(force) writes another connection's Metadata.SmartBlock while that
+// connection's close callback reads it. Only visible with the race detector, so this repro
+// is opt-in until fixed: SMART_HUNT_RACE=1 go test -race -run TestHuntR1 ./adapter/outboundgroup/
+func TestHuntR1ForcedCloseRacesCloseCallback(t *testing.T) {
+	if os.Getenv("SMART_HUNT_RACE") == "" {
+		t.Skip("KNOWN BUG R1 (data race on Metadata.SmartBlock): repro needs SMART_HUNT_RACE=1 and -race")
+	}
+	a, b := newFakeNode("a"), newFakeNode("b")
+	s := newTestSmart(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		m := tcpMeta("race.example")
+		m.SrcPort = uint16(53000 + i)
+		c, err := s.DialContext(ctx, m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr := statistic.NewTCPTracker(c, statistic.DefaultManager, m, nil, 0, 0, false)
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = tr.Close() }()
+		go func(m *C.Metadata) {
+			defer wg.Done()
+			s.closeSameConnection(&C.Metadata{UUID: "other"}, "", m.SmartTarget, true)
+		}(m)
+	}
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+}
+
+// ------------------------------------------------------------------ LC
+
+func countTimedTasks() int {
+	var buf bytes.Buffer
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+	return strings.Count(buf.String(), "outboundgroup.(*Smart).startTimedTask.func1(")
+}
+
+func newNamedSmart(t *testing.T, nodes ...*fakeNode) *Smart {
+	t.Helper()
+	proxies := make([]C.Proxy, 0, len(nodes))
+	for _, n := range nodes {
+		proxies = append(proxies, adapter.NewProxy(n))
+	}
+	pd, err := provider.NewCompatibleProvider("smart-lc", proxies, provider.NewHealthCheck(proxies, "", 0, 0, true, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewSmart(GroupCommonOption{Name: "smart-lc-" + t.Name() + "-" + time.Now().Format("150405.000000000")},
+		SmartOption{}, adapter.NewProxy(outbound.NewCompatible()), []P.ProxyProvider{pd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func waitTasks(want int) int {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n := countTimedTasks()
+		if n == want || time.Now().After(deadline) {
+			return n
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// LC: a config reload parses the new config (NewSmart -> InitSmart) before ApplyConfig closes
+// the old groups (hub/route/configs.go -> executor.ApplyConfig -> closeSmart). The
+// process-global tasks (queue flush, cache tuning, orphan clean-up) were started under the
+// old group's context, so they die with it and never restart.
+func TestHuntLCGlobalTasksSurviveConfigReload(t *testing.T) {
+	base := countTimedTasks()
+	old := newNamedSmart(t, newFakeNode("a"))
+	withGlobals := countTimedTasks() - base
+	fresh := newNamedSmart(t, newFakeNode("a")) // the new config, parsed before the old one closes
+	defer fresh.Close()
+	groupOnly := countTimedTasks() - base - withGlobals
+	_ = old.Close() // ApplyConfig -> closeSmart on the old groups
+
+	remaining := waitTasks(base+withGlobals) - base
+	if withGlobals <= groupOnly {
+		t.Fatalf("setup: expected the first group to also own the global tasks (%d vs %d)", withGlobals, groupOnly)
+	}
+	knownBug(t, "LC (global Smart tasks die on config reload)", remaining == groupOnly,
+		"after reload only the group's own tasks run ("+itoa(remaining)+"), the "+itoa(withGlobals-groupOnly)+" global tasks are gone")
+}
+
+// LC: only the first Close in the process lifetime flushes the queued learning
+// (flushQueueOnce is never reset), so every later reload or shutdown drops it.
+func TestHuntLCEveryCloseFlushesQueuedLearning(t *testing.T) {
+	first := newNamedSmart(t, newFakeNode("a"))
+	_ = first.Close() // consumes the once (if an earlier test has not already)
+
+	s := newNamedSmart(t, newFakeNode("a"))
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type: smart.OpSaveRanking, Group: s.Name(), Config: s.configName, Data: []byte(`{}`),
+	})
+	if smart.QueuedOperations() == 0 {
+		t.Fatal("setup: nothing queued")
+	}
+	_ = s.Close()
+	knownBug(t, "LC (queued learning not flushed on later closes)", smart.QueuedOperations() > 0,
+		"queue still holds "+itoa(smart.QueuedOperations())+" operation(s) after Close")
+}
+
+func itoa(n int) string {
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+		if n == 0 {
+			break
+		}
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}

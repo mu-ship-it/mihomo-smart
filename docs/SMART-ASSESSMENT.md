@@ -230,3 +230,29 @@ New findings while building the harness (confirmed; to be ranked in Phase 3):
   node B can therefore close healthy connections on node A.
 - **Observation:** a >100 MB stream at >5 MB/min is classified `sceneTransfer`, not `sceneStreaming`, because the
   transfer check runs first (weight.go:284 vs :290). Documented in the scene test; not yet judged a bug.
+
+## 10. Phase 3 bug hunt — ranked findings (hunt pass, before any fix)
+
+Adversarial scenarios run with fake nodes: node flaps, provider reload mid-connection, all nodes
+failing then recovering, UDP-only traffic, and a 200k-connection "48 h" memory run (heap profiled).
+Each confirmed defect has a repro test that is a `knownBug` marker until fixed.
+
+| Rank | ID | Finding | Impact | Repro |
+|---|---|---|---|---|
+| 1 | **B** | Every successful dial closes the target's live connections on *other* nodes (`adoptUnwrapWinner` → `closeSameConnection(force=false)`, smart.go:518). | Kills healthy Zoom UDP media and concurrent page loads whenever a new flow lands elsewhere (e.g. after one refused dial drops the pin). | `TestSmartNewFlowOnOtherNodeMustNotKillHealthy{UDPSession,TCPConn}` |
+| 2 | **R2** | A confirmed failure of node X force-closes the target's connections on **every** node, incl. UDP (`force=true` ignores `proxyName`; smart.go:1638/2083). | One bad node kills healthy calls on good nodes. Measured: b failing closed a's TCP conn *and* UDP call. | `TestHuntR2FailureOnOneNodeMustNotCloseOtherNodes` |
+| 3 | **U1** | A node that accepts UDP sessions but never returns a packet is scored healthy: no error at close, latency 0 → treated as 1 ms. | Smart keeps sending Zoom/WebRTC to a UDP-dead node. Measured: 6 silent sessions → weight 1.14 (top). | `TestHuntU1UDPBlackholeMustNotScoreAsHealthy` |
+| 4 | **R1** | Data race on `Metadata.SmartBlock`: written on other connections (smart.go:2085, 1202, hub API) while close callbacks / stats read it (1704, 1730, 1597, 1985). | Torn string reads can crash the process; wrong "degraded" accounting. | `SMART_HUNT_RACE=1 go test -race -run TestHuntR1` (opt-in until fixed) |
+| 5 | **LC** | Lifecycle: a config reload builds the new groups before closing the old ones, so the 3 process-global tasks (queue flush, cache tuning, orphan clean-up) die with the old group's context and never restart; `flushQueueOnce` means only the first `Close` ever flushes queued learning; `smartInitOnce` is reset unsynchronized; any group's `Close` closes all LightGBM collectors. | After the first API reload: learning stops being persisted on time and is dropped at shutdown; orphan records never cleaned. | `TestHuntLCGlobalTasksSurviveConfigReload`, `TestHuntLCEveryCloseFlushesQueuedLearning` |
+| 6 | **L1** | LightGBM: `recover()` covers only `PredictSingle`; panics in `NFeatures`/transforms escape into the stats goroutine (process exit), and a recovered panic returns weight 0 instead of the heuristic. | With `uselightgbm`, a bad model file can crash the core or zero every node. | `TestPredictWeightFallsBackToHeuristicOnModelPanic` |
+| 7 | **M1** | `ProbeThrottle` maps are trimmed only by age (10 min), not by count. | A burst of unique targets (P2P/DHT, scanners) grows memory: 42.7 MB per 200k targets in the profile. All other caches stayed flat (LRU-bounded): +2.1 MB at 50k→200k conns. | `TestProbeThrottleHasAHardCap` |
+| 8 | **W2** | Latency/connect score clamped at 0.8: every latency below ~335 ms scores the same. | Cannot prefer a 30 ms node over a 300 ms one — the Zoom-relevant range. | `TestCalculateWeightDistinguishesLatencyBelow335ms` |
+| 9 | **W1** | A connection with no first-read latency (never received a byte) is scored as 1 ms. (Connect time 0 is a real sub-ms dial on multiplexed transports and stays fast.) | Unanswered connections look like the best ones; feeds U1. | `TestCalculateWeightMissingLatencyIsNotBest` |
+
+Scenarios that held up (no defect): all nodes failing then recovering (first dial after recovery succeeds);
+a flapping node (traffic shifts to the stable node: 36 of 40 dials); provider reload removing the pinned node
+(fails over, re-adds cleanly; an empty provider falls back to `COMPATIBLE` as configured); no goroutine growth
+over 200k connections.
+
+Not bugs, kept as feature backlog (Zoom-grade selection, §6): UDP stats only at session close; no UDP
+jitter/loss; no active STUN probe. Observation only: >100 MB streams classified as transfer.

@@ -208,16 +208,17 @@ func TestCalculateTrafficFactorBounded(t *testing.T) {
 	}
 }
 
-// Known bug (assessment §4): a connection with no measured connect time / latency is
-// scored as if it had 1 ms, i.e. better than any measured node.
-func TestCalculateWeightMissingMeasurementIsNotBest(t *testing.T) {
+// Known bug W1: a connection that never received a byte has no first-read latency (0) and
+// is scored as if it had 1 ms, i.e. better than any measured node. (A connect time of 0 is
+// different: it is a real sub-millisecond dial on multiplexed transports and stays fast.)
+func TestCalculateWeightMissingLatencyIsNotBest(t *testing.T) {
 	measured := baseline()
-	measured.ConnectTime, measured.Latency = 20, 20
+	measured.Latency = 20
 	missing := baseline()
-	missing.ConnectTime, missing.Latency = 0, 0
+	missing.Latency = 0
 	wm, wx := weightOf(t, measured, 1), weightOf(t, missing, 1)
-	knownBug(t, "W1 (weight.go:121 missing measurement = 1 ms)", wx >= wm,
-		"unmeasured node weight >= a measured 20 ms node")
+	knownBug(t, "W1 (weight.go:129 missing latency = 1 ms)", wx >= wm,
+		"node with no measured latency weighs >= a measured 20 ms node")
 }
 
 // Known bug (assessment §4): latency score is clamped at 0.8, so every latency below ~335 ms

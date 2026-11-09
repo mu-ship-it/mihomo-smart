@@ -60,6 +60,7 @@ type fakeNode struct {
 	tcpFail  atomic.Bool
 	udpFail  atomic.Bool
 	tcpDelay time.Duration
+	noRecord bool // do not keep conns (long-running memory tests)
 	tcpDials atomic.Int64
 	udpDials atomic.Int64
 	mu       sync.Mutex
@@ -88,9 +89,11 @@ func (n *fakeNode) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 	a, b := net.Pipe()
 	go func() { _, _ = b.Read(make([]byte, 1)); _ = b.Close() }()
 	rc := &closeRecorderConn{Conn: a}
-	n.mu.Lock()
-	n.tcpConns = append(n.tcpConns, rc)
-	n.mu.Unlock()
+	if !n.noRecord {
+		n.mu.Lock()
+		n.tcpConns = append(n.tcpConns, rc)
+		n.mu.Unlock()
+	}
 	return outbound.NewConn(rc, n), nil
 }
 
@@ -126,7 +129,7 @@ func newTestSmart(t *testing.T, nodes ...*fakeNode) *Smart {
 	// Smart keeps learned state in a process-global store keyed by group name, so every
 	// instance gets a unique name (go test -count=N reruns tests in the same process).
 	name := fmt.Sprintf("smart-test-%s-%d", t.Name(), testGroupSeq.Add(1))
-	s, err := NewSmart(GroupCommonOption{Name: name}, SmartOption{}, nil, []P.ProxyProvider{pd})
+	s, err := NewSmart(GroupCommonOption{Name: name}, SmartOption{}, adapter.NewProxy(outbound.NewCompatible()), []P.ProxyProvider{pd})
 	if err != nil {
 		t.Fatal(err)
 	}
