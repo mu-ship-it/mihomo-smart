@@ -119,7 +119,15 @@ func TestHuntU1UDPBlackholeMustNotScoreAsHealthy(t *testing.T) {
 	if sessions == 0 {
 		t.Fatal("setup: no session was ever opened on a")
 	}
-	time.Sleep(300 * time.Millisecond) // close callbacks record asynchronously
+	// close callbacks record asynchronously: judge only once every session is in a's record
+	key := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, "a")
+	rec := s.store.GetOrCreateAtomicRecord(key, s.Name(), s.configName, target, "a")
+	for deadline := time.Now().Add(5 * time.Second); rec.Success()+rec.Failure() < int64(sessions); {
+		if time.Now().After(deadline) {
+			t.Fatalf("setup: only %d of %d sessions recorded", rec.Success()+rec.Failure(), sessions)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	names, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, target, true)
 	if err != nil && !strings.Contains(err.Error(), "no best node") {
@@ -243,11 +251,14 @@ func TestHuntLCEveryCloseFlushesQueuedLearning(t *testing.T) {
 	keep := newNamedSmart(t, newFakeNode("a"))
 	defer keep.Close()
 	s := newNamedSmart(t, newFakeNode("a"))
+	// start from an empty queue: ops left by earlier tests could otherwise hit the batch
+	// threshold on the append below and be saved before the check
+	s.store.FlushQueue(true)
 	s.store.AppendToGlobalQueue(smart.StoreOperation{
 		Type: smart.OpSaveRanking, Group: s.Name(), Config: s.configName, Data: []byte(`{}`),
 	})
-	if smart.QueuedOperations() == 0 {
-		t.Fatal("setup: nothing queued")
+	if smart.QueuedOperations() != 1 {
+		t.Fatalf("setup: expected exactly 1 queued operation, got %d", smart.QueuedOperations())
 	}
 	_ = s.Close()
 	if smart.QueuedOperations() > 0 {
