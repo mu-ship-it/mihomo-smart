@@ -212,23 +212,39 @@ func TestCalculateTrafficFactorBounded(t *testing.T) {
 // is scored as if it had 1 ms, i.e. better than any measured node. (A connect time of 0 is
 // different: it is a real sub-millisecond dial on multiplexed transports and stays fast.)
 func TestCalculateWeightMissingLatencyIsNotBest(t *testing.T) {
-	measured := baseline()
-	measured.Latency = 20
 	missing := baseline()
 	missing.Latency = 0
-	wm, wx := weightOf(t, measured, 1), weightOf(t, missing, 1)
-	knownBug(t, "W1 (weight.go:129 missing latency = 1 ms)", wx >= wm,
-		"node with no measured latency weighs >= a measured 20 ms node")
+	wx := weightOf(t, missing, 1)
+	// 20 ms also earns the low-latency bonus; 200 ms does not, so it checks the score itself
+	for _, ms := range []int64{20, 200} {
+		measured := baseline()
+		measured.Latency = ms
+		if wm := weightOf(t, measured, 1); wx >= wm {
+			t.Fatalf("regression W1 (missing latency = 1 ms): node with no measured latency weighs %.4f >= a measured %d ms node (%.4f)", wx, ms, wm)
+		}
+	}
+	// but an unanswered connection is not scored like a failed one either
+	failed := baseline()
+	failed.Latency, failed.ConnectionFailed = 0, true
+	if wf := weightOf(t, failed, 1); wf >= wx {
+		t.Fatalf("unknown latency (%.4f) should score above a failed connection (%.4f)", wx, wf)
+	}
 }
 
 // Known bug (assessment §4): latency score is clamped at 0.8, so every latency below ~335 ms
 // scores the same and a 30 ms node is indistinguishable from a 300 ms one (apart from a flat
 // +0.1 bonus under 100 ms, which cannot separate 120 ms from 330 ms).
 func TestCalculateWeightDistinguishesLatencyBelow335ms(t *testing.T) {
-	fast, slow := baseline(), baseline()
-	fast.IsUDP, fast.IsTCP, fast.Latency = true, false, 120
-	slow.IsUDP, slow.IsTCP, slow.Latency = true, false, 330
-	wf, ws := weightOf(t, fast, 1), weightOf(t, slow, 1)
-	knownBug(t, "W2 (weight.go:139-142 latency clamp)", wf == ws,
-		"UDP 120 ms and 330 ms nodes get identical weight")
+	// interactive UDP range: each step must cost a visible amount of weight (>= 1%)
+	steps := []int64{30, 120, 330}
+	prev := -1.0
+	for _, ms := range steps {
+		in := baseline()
+		in.IsUDP, in.IsTCP, in.Latency = true, false, ms
+		w := weightOf(t, in, 1)
+		if prev > 0 && (prev-w)/prev < 0.01 {
+			t.Fatalf("regression W2 (latency clamp): UDP %d ms weighs %.4f, not meaningfully below the previous step (%.4f)", ms, w, prev)
+		}
+		prev = w
+	}
 }

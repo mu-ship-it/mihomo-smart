@@ -8,7 +8,7 @@ import (
 	"github.com/vernesong/leaves"
 )
 
-// L1: PredictWeight's recover() only wraps PredictSingle and assigns its fallback to a local
+// L1 (fixed): PredictWeight's recover() only wraps PredictSingle and assigns its fallback to a local
 // variable, so (a) a panic anywhere else in the model path (NFeatures, transforms) escapes —
 // and PredictWeight runs inside recordConnectionStats' goroutine, where an escaping panic
 // exits the whole process — and (b) a recovered panic returns (0, false), not the heuristic.
@@ -29,9 +29,10 @@ func TestPredictWeightFallsBackToHeuristicOnModelPanic(t *testing.T) {
 		finished = true
 	}()
 
-	reproduced := escaped != nil || !finished || got != want
-	if reproduced {
-		t.Skipf("KNOWN BUG L1 (LightGBM panic escapes / returns 0) reproduced: escaped=%v got=%v want=%v", escaped, got, want)
+	if escaped != nil || !finished {
+		t.Fatalf("regression L1: a model panic escaped PredictWeight: %v", escaped)
 	}
-	t.Fatal("KNOWN BUG L1 no longer reproduces: remove the marker and assert the fixed behaviour")
+	if got != want {
+		t.Fatalf("regression L1: after a model panic got weight %v, want the heuristic %v", got, want)
+	}
 }

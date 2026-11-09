@@ -81,10 +81,72 @@ const (
 	blockCodeStalled   = 6
 )
 
-var (
-	flushQueueOnce atomic.Bool
-	smartInitOnce  sync.Once
-)
+// errUDPNoReply marks a UDP session that sent data for stalledConnectionGrace or longer and
+// never received a packet.
+var errUDPNoReply = errors.New("udp session got no reply")
+
+// smartGlobals owns the process-wide Smart tasks (queue flush, cache tuning, orphan clean-up).
+// They run while at least one Smart group is alive. A config reload builds the new groups
+// before it closes the old ones, so a reference count (rather than a sync.Once bound to the
+// first group's context) keeps them running across reloads (LC).
+var smartGlobals struct {
+	mu     sync.Mutex
+	refs   int
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func (s *Smart) acquireGlobals() {
+	smartGlobals.mu.Lock()
+	defer smartGlobals.mu.Unlock()
+	smartGlobals.refs++
+	if smartGlobals.refs > 1 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	smartGlobals.cancel = cancel
+	store := s.store
+	runTimedTask(ctx, &smartGlobals.wg, "global", 5*time.Minute, checkInterval, "Global orphaned groups Clean up",
+		func() { cleanupOrphanedSmartGroups(store, currentConfigName()) }, true)
+	runTimedTask(ctx, &smartGlobals.wg, "global", 5*time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment",
+		store.AdjustCacheParameters, false)
+	runTimedTask(ctx, &smartGlobals.wg, "global", 5*time.Minute, flushQueueInterval, "Global queues flush",
+		func() { store.FlushQueue(true) }, false)
+	// the database belongs to the process, so one load serves every group
+	if s.preferASN {
+		if err := geodata.InitASN(); err != nil {
+			log.Warnln("[Smart] Failed to load ASN database: %v", err)
+		}
+	}
+}
+
+// releaseGlobals stops the process-wide tasks and closes the collectors once the last Smart
+// group is gone.
+func releaseGlobals(store *smart.Store) {
+	smartGlobals.mu.Lock()
+	smartGlobals.refs--
+	last := smartGlobals.refs <= 0
+	var cancel context.CancelFunc
+	if last {
+		smartGlobals.refs = 0
+		cancel, smartGlobals.cancel = smartGlobals.cancel, nil
+	}
+	smartGlobals.mu.Unlock()
+	if !last {
+		return
+	}
+	if cancel != nil {
+		cancel()
+	}
+	smartGlobals.wg.Wait()
+	store.FlushQueue(true)
+	lightgbm.CloseAllCollectors()
+}
+
+func currentConfigName() string {
+	configFile := C.Path.Config()
+	return strings.TrimSuffix(filepath.Base(configFile), filepath.Ext(configFile))
+}
 
 type SmartOption struct {
 	PolicyPriority string  `group:"policy-priority,omitempty"`
@@ -110,7 +172,6 @@ type Smart struct {
 	expectedStatus string
 	disableUDP     bool
 
-	dataCollector  *lightgbm.DataCollector
 	weightModel    *lightgbm.WeightModel
 	policyPriority []priorityRule
 	priorityCache  xsync.Map[string, float64]
@@ -137,6 +198,8 @@ type Smart struct {
 	lossSampler   *tcpstats.LossSampler
 
 	exitWatch *smart.ExitWatcher
+
+	closed atomic.Bool
 }
 
 type dialResult struct {
@@ -502,8 +565,10 @@ func (s *Smart) dropUnwrapPins(target string) {
 	s.store.DeleteUnwrapResult(s.Name(), s.configName, smart.NetScopedTarget(target, true))
 }
 
+// adoptUnwrapWinner makes the node that won this dial the target's pin. It only steers new
+// connections: live connections on other nodes are healthy as far as anything has shown, so
+// they are left alone (closing them killed in-progress calls and page loads, bug B).
 func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, p C.Proxy) {
-	target := metadata.SmartTarget
 	key := s.unwrapKey(metadata)
 	existing, _ := s.store.GetUnwrapResult(s.Name(), s.configName, key)
 
@@ -515,7 +580,6 @@ func (s *Smart) adoptUnwrapWinner(metadata *C.Metadata, p C.Proxy) {
 		s.store.DeleteUnwrapResult(s.Name(), s.configName, key)
 		s.store.StoreUnwrapResult(s.Name(), s.configName, key, []C.Proxy{p})
 	}
-	s.closeSameConnection(metadata, p.Name(), target, false)
 }
 
 func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
@@ -1199,7 +1263,7 @@ func (s *Smart) recordSiteKey(metadata *C.Metadata, site string) {
 		if !lo.Contains(tracker.Chains(), s.Name()) {
 			return true
 		}
-		info.Metadata.SmartBlock = "degraded"
+		info.Metadata.SetSmartBlock("degraded")
 		_ = tracker.Close()
 		return true
 	})
@@ -1408,7 +1472,8 @@ func (s *Smart) collectConnectionData(input *smart.ModelInput, metadata *C.Metad
 		weightSource = "LightGBM"
 	}
 
-	s.dataCollector.AddSample(input, metadata, baseWeight, weightSource)
+	// fetched per sample: a reload replaces the collector while this group lives on
+	lightgbm.GetCollector().AddSample(input, metadata, baseWeight, weightSource)
 }
 
 func updateEMA[T int64 | float64](oldValue, newValue T) T {
@@ -1594,7 +1659,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// a pinned group and a force-closed connection never reach the host checks, so their
 	// snapshot is not read at all
 	var state targetState
-	if s.selected == "" && metadata.SmartBlock != "blocked" && metadata.SmartBlock != "degraded" {
+	if s.selected == "" && metadata.GetSmartBlock() != "blocked" && metadata.GetSmartBlock() != "degraded" {
 		state = s.readTargetState(metadata, proxyName)
 	}
 	adjWeight, isDegraded, checked, blockCode := s.checkNodeQuality(state, metadata, proxy, connQuality{
@@ -1635,7 +1700,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 				s.Name(), proxyName, addressDisplay)
 		}
 		if !isUDP {
-			s.closeSameConnection(metadata, proxyName, target, true)
+			s.closeNodeConnections(metadata, proxyName, target)
 		}
 		s.store.DeleteUnwrapResult(s.Name(), s.configName, s.unwrapKey(metadata))
 	}
@@ -1701,7 +1766,7 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 			}
 
 			// a connection the group closed on purpose is not a transfer failure
-			if metadata.SmartBlock == "degraded" {
+			if metadata.GetSmartBlock() == "degraded" {
 				closeErr = nil
 			}
 
@@ -1726,8 +1791,15 @@ func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Pr
 			if closeErr == nil {
 				closeErr = observedWriteErr.Load()
 			}
+			// a session that kept sending but never got a single packet back is a dead UDP
+			// path (blackholed or congested to nothing); without this it closes cleanly with
+			// no latency and is scored as a healthy node (U1)
+			if closeErr == nil && udpLatency.Load() == 0 && uploadTotal > 0 && downloadTotal == 0 &&
+				connectionDuration >= stalledConnectionGrace.Milliseconds() {
+				closeErr = errUDPNoReply
+			}
 			// a connection the group closed on purpose is not a transfer failure
-			if metadata.SmartBlock == "degraded" {
+			if metadata.GetSmartBlock() == "degraded" {
 				closeErr = nil
 			}
 
@@ -1982,14 +2054,14 @@ func (s *Smart) checkNodeQuality(state targetState, metadata *C.Metadata, proxy 
 	proxyName := proxy.Name()
 
 	// user manual block
-	if metadata.SmartBlock == "blocked" {
+	if metadata.GetSmartBlock() == "blocked" {
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected manual block...",
 			s.Name(), proxyName, metadata.NetWork.String(), q.address)
 		return q.weight, true, true, blockCodeManual
 	}
 
 	// force-closed connection, skip quality check to avoid erroneous downgrade
-	if metadata.SmartBlock == "degraded" {
+	if metadata.GetSmartBlock() == "degraded" {
 		return q.oldWeight, false, false, 0
 	}
 
@@ -2067,9 +2139,13 @@ func (s *Smart) ruleExcluded(target, node string) bool {
 	return failNodes[node] != 0
 }
 
-// closeSameConnection closes the other connections of the target so it keeps a single exit:
-// force drops them all because the node was dropped, otherwise only the ones on another node.
-func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target string, force bool) {
+// closeNodeConnections closes this group's live connections to target that go through the
+// failing node proxyName and use the same network as the failure. Connections on other nodes,
+// and e.g. a UDP call when a TCP dial failed, are not evidence of anything and stay up (R2).
+func (s *Smart) closeNodeConnections(metadata *C.Metadata, proxyName, target string) {
+	if proxyName == "" || target == "" {
+		return
+	}
 	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
 		if id == metadata.UUID {
 			return true
@@ -2078,15 +2154,16 @@ func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target stri
 		if tracker == nil {
 			return true
 		}
-		if !lo.Contains(tracker.Chains(), s.Name()) {
+		chains := tracker.Chains()
+		if !lo.Contains(chains, s.Name()) || !lo.Contains(chains, proxyName) {
 			return true
 		}
-		if force {
-			tracker.Info().Metadata.SmartBlock = "degraded"
-			_ = tracker.Close()
-		} else if proxyName != "" && !lo.Contains(tracker.Chains(), proxyName) {
-			_ = tracker.Close()
+		info := tracker.Info()
+		if info == nil || info.Metadata == nil || info.Metadata.NetWork != metadata.NetWork {
+			return true
 		}
+		info.Metadata.SetSmartBlock("degraded")
+		_ = tracker.Close()
 		return true
 	})
 }
@@ -2266,7 +2343,7 @@ func (s *Smart) probeAfterClose(metadata *C.Metadata, proxy C.Proxy, eligible bo
 		s.probeThrottle.NoteFailure(clone.WildcardTarget, nodeName, time.Now())
 		s.applyNodeAnswer(proxy, clone, clone.WildcardTarget, nodeName, verdict)
 		if s.ruleExcluded(clone.SmartTarget, nodeName) {
-			s.closeSameConnection(clone, nodeName, clone.SmartTarget, true)
+			s.closeNodeConnections(clone, nodeName, clone.SmartTarget)
 			s.dropUnwrapPins(clone.SmartTarget)
 		}
 		log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), nodeName, clone.Host, verdict.TTL, verdict.Reason)
@@ -2319,19 +2396,7 @@ func (s *Smart) InitSmart() {
 		WantASN: func() bool { return s.preferASN },
 	})
 
-	smartInitOnce.Do(func() {
-		s.startTimedTask(5*time.Minute, checkInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment", s.store.AdjustCacheParameters, false)
-		s.startTimedTask(5*time.Minute, flushQueueInterval, "Global queues flush", func() {
-			s.store.FlushQueue(true)
-		}, false)
-		// the database belongs to the process, so one load serves every group
-		if s.preferASN {
-			if err := geodata.InitASN(); err != nil {
-				log.Warnln("[Smart] Failed to load ASN database: %v", err)
-			}
-		}
-	})
+	s.acquireGlobals()
 
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
 	s.startTimedTask(5*time.Minute, prefetchInterval, "Group targets prefetch", s.runPrefetch, false)
@@ -2344,26 +2409,29 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group old records clean up", func() {
 		s.store.CleanupOldRecords(s.Name(), s.configName)
 	}, false)
-	if s.collectData {
-		s.dataCollector = lightgbm.GetCollector()
-	}
 
 	if s.useLightGBM {
 		s.weightModel = lightgbm.GetModel()
 	}
 }
 
-// startTimedTask waits for tunnel.Running before the first run, then repeats on its interval.
+// startTimedTask runs a task owned by this group: it stops when the group closes.
 func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName string, task func(), runOnce bool) {
-	s.wg.Add(1)
+	runTimedTask(s.ctx, &s.wg, s.Name(), initialDelay, interval, taskName, task, runOnce)
+}
+
+// runTimedTask waits for tunnel.Running before the first run, then repeats on its interval
+// until ctx is done.
+func runTimedTask(ctx context.Context, wg *sync.WaitGroup, owner string, initialDelay, interval time.Duration, taskName string, task func(), runOnce bool) {
+	wg.Add(1)
 	go func() {
-		defer s.wg.Done()
+		defer wg.Done()
 
 		waitTicker := time.NewTicker(100 * time.Millisecond)
 		for tunnel.Status() != tunnel.Running {
 			select {
 			case <-waitTicker.C:
-			case <-s.ctx.Done():
+			case <-ctx.Done():
 				waitTicker.Stop()
 				return
 			}
@@ -2378,7 +2446,7 @@ func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName st
 
 		select {
 		case <-time.After(adjustedInitialDelay):
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 
@@ -2390,7 +2458,7 @@ func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName st
 			log.Debugln("[Smart] Task [%s] completed", taskName)
 			return
 		}
-		log.Debugln("[Smart] Task [%s] for group [%s] started, interval: %s", taskName, s.Name(), adjustedInterval.Round(time.Second).String())
+		log.Debugln("[Smart] Task [%s] for group [%s] started, interval: %s", taskName, owner, adjustedInterval.Round(time.Second).String())
 
 		ticker := time.NewTicker(adjustedInterval)
 		defer ticker.Stop()
@@ -2401,7 +2469,7 @@ func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName st
 				if tunnel.Status() == tunnel.Running {
 					task()
 				}
-			case <-s.ctx.Done():
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -2488,7 +2556,7 @@ func (s *Smart) updateNodeRanking() {
 		smart.RankRarelyUsed, categoryCounts[smart.RankRarelyUsed])
 }
 
-func (s *Smart) cleanupOrphanedGroups() {
+func cleanupOrphanedSmartGroups(store *smart.Store, configName string) {
 	allProxies := tunnel.Proxies()
 	existingSmartGroups := make(map[string]bool)
 
@@ -2498,7 +2566,7 @@ func (s *Smart) cleanupOrphanedGroups() {
 		}
 	}
 
-	cachedGroups, err := s.store.GetAllGroupsForConfig(s.configName)
+	cachedGroups, err := store.GetAllGroupsForConfig(configName)
 	if err != nil {
 		return
 	}
@@ -2513,7 +2581,7 @@ func (s *Smart) cleanupOrphanedGroups() {
 	if len(orphanedGroups) > 0 {
 		for _, group := range orphanedGroups {
 			log.Debugln("[Smart] Cleaning up cache data for non-existent policy group [%s]", group)
-			err := s.store.FlushByGroup(group, s.configName)
+			err := store.FlushByGroup(group, configName)
 			if err != nil {
 				log.Warnln("[Smart] Failed to clean up policy group [%s] cache: %v", group, err)
 			}
@@ -2553,19 +2621,20 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 }
 
 func (s *Smart) Close() error {
+	// closeSmart may run more than once for the same group (reload, then shutdown)
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
 
 	s.wg.Wait()
 
-	if !flushQueueOnce.Swap(true) {
-		s.store.FlushQueue(true)
-	}
+	// every close persists the queued learning, not only the first one in the process
+	s.store.FlushQueue(true)
 
-	lightgbm.CloseAllCollectors()
-
-	smartInitOnce = sync.Once{}
+	releaseGlobals(s.store)
 
 	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"os"
 	"runtime/pprof"
 	"strings"
 	"sync"
@@ -36,8 +35,9 @@ func proxyByName(s *Smart, name string) C.Proxy {
 // ------------------------------------------------------------------ R2
 
 // R2: a confirmed failure of node b for a target force-closes the target's connections on
-// every node (smart.go:1638 -> closeSameConnection force=true, which ignores proxyName),
-// including a healthy UDP call on node a.
+// every node (smart.go:1638 -> closeSameConnection force=true, which ignored proxyName),
+// including a healthy UDP call on node a. Fixed: closeNodeConnections is scoped to the failing
+// node and to the failure's network.
 func TestHuntR2FailureOnOneNodeMustNotCloseOtherNodes(t *testing.T) {
 	a, b := newFakeNode("a"), newFakeNode("b")
 	s := newTestSmart(t, a, b)
@@ -74,8 +74,9 @@ func TestHuntR2FailureOnOneNodeMustNotCloseOtherNodes(t *testing.T) {
 	tcpClosed := a.tcpConns[0].closed.Load()
 	udpClosed := a.udpConns[0].closed.Load()
 	a.mu.Unlock()
-	knownBug(t, "R2 (forced close not scoped to failing node)", tcpClosed || udpClosed,
-		"node b failing closed node a's healthy connections (tcp closed="+boolStr(tcpClosed)+", udp call closed="+boolStr(udpClosed)+")")
+	if tcpClosed || udpClosed {
+		t.Fatal("regression " + "R2 (forced close not scoped to failing node)" + ": " + "node b failing closed node a's healthy connections (tcp closed=" + boolStr(tcpClosed) + ", udp call closed=" + boolStr(udpClosed) + ")")
+	}
 }
 
 func boolStr(b bool) string {
@@ -92,29 +93,36 @@ func boolStr(b bool) string {
 // session closes without error, latency is 0 and is then treated as 1 ms.
 func TestHuntU1UDPBlackholeMustNotScoreAsHealthy(t *testing.T) {
 	a, b := newFakeNode("a"), newFakeNode("b")
-	b.udpFail.Store(true)
+	b.udpFail.Store(true) // b refuses UDP: a is the only node that ever accepts a session
 	s := newTestSmart(t, a, b)
 
-	var target string
+	target := ""
+	sessions := 0
 	for i := 0; i < 6; i++ {
 		m := udpMeta("zoom.us", uint16(52000+i))
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		pc, err := s.ListenPacketContext(ctx, m)
 		cancel()
-		if err != nil {
-			t.Fatal(err)
-		}
 		target = m.SmartTarget
+		if err != nil {
+			// a never refuses, so a failed listen means Smart stopped offering a: fixed behaviour
+			break
+		}
+		sessions++
 		tr := statistic.NewUDPTracker(pc, statistic.DefaultManager, m, nil, 0, 0, false)
 		// the client sends media for 10 s and never receives anything back
 		_, _ = tr.WriteTo(bytes.Repeat([]byte{1}, 1200), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
 		tr.Info().Start = time.Now().Add(-10 * time.Second)
 		_ = tr.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if sessions == 0 {
+		t.Fatal("setup: no session was ever opened on a")
 	}
 	time.Sleep(300 * time.Millisecond) // close callbacks record asynchronously
 
 	names, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, target, true)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "no best node") {
 		t.Fatal(err)
 	}
 	healthy := false
@@ -123,19 +131,23 @@ func TestHuntU1UDPBlackholeMustNotScoreAsHealthy(t *testing.T) {
 			healthy = true
 		}
 	}
-	knownBug(t, "U1 (UDP blackhole scored healthy)", healthy,
-		"node a never answered 6 UDP sessions yet is ranked "+strings.Join(names, ",")+" with weight >= AllowedWeight")
+	offered := false
+	cands, _, _ := s.selectProxies(udpMeta("zoom.us", 52100), s.GetProxies(true))
+	for _, p := range cands {
+		offered = offered || p.Name() == "a"
+	}
+	if healthy && offered {
+		t.Fatalf("regression U1 (UDP blackhole scored healthy): node a never answered %d UDP sessions yet is still offered and ranked %s with weight >= AllowedWeight",
+			sessions, strings.Join(names, ","))
+	}
 }
 
 // ------------------------------------------------------------------ R1
 
-// R1: closeSameConnection(force) writes another connection's Metadata.SmartBlock while that
-// connection's close callback reads it. Only visible with the race detector, so this repro
-// is opt-in until fixed: SMART_HUNT_RACE=1 go test -race -run TestHuntR1 ./adapter/outboundgroup/
+// R1: a forced close writes another connection's Metadata.SmartBlock while that connection's
+// close callback reads it. Regression test for the race detector (CI runs this package with
+// -race); without -race it still exercises the path.
 func TestHuntR1ForcedCloseRacesCloseCallback(t *testing.T) {
-	if os.Getenv("SMART_HUNT_RACE") == "" {
-		t.Skip("KNOWN BUG R1 (data race on Metadata.SmartBlock): repro needs SMART_HUNT_RACE=1 and -race")
-	}
 	a, b := newFakeNode("a"), newFakeNode("b")
 	s := newTestSmart(t, a, b)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -152,10 +164,10 @@ func TestHuntR1ForcedCloseRacesCloseCallback(t *testing.T) {
 		tr := statistic.NewTCPTracker(c, statistic.DefaultManager, m, nil, 0, 0, false)
 		wg.Add(2)
 		go func() { defer wg.Done(); _ = tr.Close() }()
-		go func(m *C.Metadata) {
+		go func(m *C.Metadata, node string) {
 			defer wg.Done()
-			s.closeSameConnection(&C.Metadata{UUID: "other"}, "", m.SmartTarget, true)
-		}(m)
+			s.closeNodeConnections(&C.Metadata{UUID: "other", NetWork: C.TCP}, node, m.SmartTarget)
+		}(m, lastNode(c.Chains()))
 	}
 	wg.Wait()
 	time.Sleep(200 * time.Millisecond)
@@ -166,7 +178,7 @@ func TestHuntR1ForcedCloseRacesCloseCallback(t *testing.T) {
 func countTimedTasks() int {
 	var buf bytes.Buffer
 	_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
-	return strings.Count(buf.String(), "outboundgroup.(*Smart).startTimedTask.func1(")
+	return strings.Count(buf.String(), "outboundgroup.runTimedTask.func1(")
 }
 
 func newNamedSmart(t *testing.T, nodes ...*fakeNode) *Smart {
@@ -215,8 +227,9 @@ func TestHuntLCGlobalTasksSurviveConfigReload(t *testing.T) {
 	if withGlobals <= groupOnly {
 		t.Fatalf("setup: expected the first group to also own the global tasks (%d vs %d)", withGlobals, groupOnly)
 	}
-	knownBug(t, "LC (global Smart tasks die on config reload)", remaining == groupOnly,
-		"after reload only the group's own tasks run ("+itoa(remaining)+"), the "+itoa(withGlobals-groupOnly)+" global tasks are gone")
+	if remaining == groupOnly {
+		t.Fatal("regression " + "LC (global Smart tasks die on config reload)" + ": " + "after reload only the group's own tasks run (" + itoa(remaining) + "), the " + itoa(withGlobals-groupOnly) + " global tasks are gone")
+	}
 }
 
 // LC: only the first Close in the process lifetime flushes the queued learning
@@ -225,6 +238,10 @@ func TestHuntLCEveryCloseFlushesQueuedLearning(t *testing.T) {
 	first := newNamedSmart(t, newFakeNode("a"))
 	_ = first.Close() // consumes the once (if an earlier test has not already)
 
+	// as in a reload, another group stays alive while this one closes: only Close's own flush
+	// (not the last-group shutdown flush) can persist the queue here
+	keep := newNamedSmart(t, newFakeNode("a"))
+	defer keep.Close()
 	s := newNamedSmart(t, newFakeNode("a"))
 	s.store.AppendToGlobalQueue(smart.StoreOperation{
 		Type: smart.OpSaveRanking, Group: s.Name(), Config: s.configName, Data: []byte(`{}`),
@@ -233,8 +250,9 @@ func TestHuntLCEveryCloseFlushesQueuedLearning(t *testing.T) {
 		t.Fatal("setup: nothing queued")
 	}
 	_ = s.Close()
-	knownBug(t, "LC (queued learning not flushed on later closes)", smart.QueuedOperations() > 0,
-		"queue still holds "+itoa(smart.QueuedOperations())+" operation(s) after Close")
+	if smart.QueuedOperations() > 0 {
+		t.Fatal("regression " + "LC (queued learning not flushed on later closes)" + ": " + "queue still holds " + itoa(smart.QueuedOperations()) + " operation(s) after Close")
+	}
 }
 
 func itoa(n int) string {
@@ -257,4 +275,38 @@ func itoa(n int) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// The other half of R2: scoping must not stop a failing node's own connections from being
+// closed, and a TCP failure must not close a UDP flow on the same node.
+func TestSmartFailingNodeOwnConnectionsAreStillClosed(t *testing.T) {
+	a, b := newFakeNode("a"), newFakeNode("b")
+	s := newTestSmart(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	a.tcpFail.Store(true)
+	a.udpFail.Store(true)
+	m := tcpMeta("zoom.us")
+	c, err := s.DialContext(ctx, m)
+	if err != nil || lastNode(c.Chains()) != "b" {
+		t.Fatalf("setup tcp on b: %v", err)
+	}
+	tr := statistic.NewTCPTracker(c, statistic.DefaultManager, m, nil, 0, 0, false)
+	t.Cleanup(func() { _ = tr.Close() })
+	call, _ := openTrackedUDP(t, s, 50200)
+	if lastNode(call.Chains()) != "b" {
+		t.Fatal("setup: udp not on b")
+	}
+
+	s.closeNodeConnections(&C.Metadata{UUID: "failure", NetWork: C.TCP}, "b", m.SmartTarget)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.tcpConns[0].closed.Load() {
+		t.Fatal("the failing node's TCP connection to the target was not closed")
+	}
+	if b.udpConns[0].closed.Load() {
+		t.Fatal("a TCP failure closed the node's UDP flow")
+	}
 }

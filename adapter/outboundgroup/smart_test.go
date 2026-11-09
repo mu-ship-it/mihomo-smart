@@ -439,9 +439,9 @@ func TestSmartNewFlowOnOtherNodeMustNotKillHealthyUDPSession(t *testing.T) {
 	callClosed := a.udpConns[0].closed.Load()
 	a.mu.Unlock()
 
-	knownBug(t, "B (smart.go:518 cross-node close)", callClosed,
-		"healthy UDP session on node a was closed because another flow to "+callMeta.SmartTarget+" succeeded on node b")
-	// after the fix: the call must still be open
+	if callClosed {
+		t.Fatal("regression " + "B (smart.go:518 cross-node close)" + ": " + "healthy UDP session on node a was closed because another flow to " + callMeta.SmartTarget + " succeeded on node b")
+	}
 }
 
 // Same-node siblings are never closed today; this guards the part that already works.
@@ -505,6 +505,7 @@ func TestSmartNewFlowOnOtherNodeMustNotKillHealthyTCPConn(t *testing.T) {
 	if a.tcpDials.Load()+b.tcpDials.Load() != 1 {
 		t.Fatalf("setup: expected exactly one dial, got a=%d b=%d", a.tcpDials.Load(), b.tcpDials.Load())
 	}
-	knownBug(t, "B (smart.go:518 cross-node close, TCP)", closed,
-		"healthy TCP conn on node "+first.Name()+" was closed because another conn to "+m1.SmartTarget+" was won by node "+other.Name())
+	if closed {
+		t.Fatal("regression " + "B (smart.go:518 cross-node close, TCP)" + ": " + "healthy TCP conn on node " + first.Name() + " was closed because another conn to " + m1.SmartTarget + " was won by node " + other.Name())
+	}
 }

@@ -256,3 +256,31 @@ over 200k connections.
 
 Not bugs, kept as feature backlog (Zoom-grade selection, §6): UDP stats only at session close; no UDP
 jitter/loss; no active STUN probe. Observation only: >100 MB streams classified as transfer.
+
+## 11. Phase 3 fix pass
+
+Every finding in §10 is fixed, and its marker is now an ordinary regression test. Each test was checked
+three ways: it fails on the pre-fix code (`57c6540a`), it passes with the fix, and it fails again when only
+that fix is reverted (mutation check).
+
+| ID | Fix | Regression test(s) |
+|---|---|---|
+| B | `adoptUnwrapWinner` only updates the pin; it no longer closes live connections on other nodes. | `TestSmartNewFlowOnOtherNodeMustNotKillHealthy{UDPSession,TCPConn}` |
+| R2 | `closeSameConnection(force)` → `closeNodeConnections`: closes only the failing node's connections to the target, and only those on the failure's network (a TCP failure no longer drops a UDP call). | `TestHuntR2…`, `TestSmartFailingNodeOwnConnectionsAreStillClosed` |
+| U1 | A UDP session that sent data for ≥ 4 s (`stalledConnectionGrace`) and never received a packet closes with `errUDPNoReply`, so it counts as a failure, drops the pin and steers new flows elsewhere. | `TestHuntU1UDPBlackholeMustNotScoreAsHealthy` |
+| R1 | `Metadata.GetSmartBlock/SetSmartBlock`, guarded by a lock that `Clone`/`Pure` also take; all cross-goroutine readers and writers use them (Smart, tunnel, hub API). | `TestHuntR1ForcedCloseRacesCloseCallback` (CI runs it with `-race`) |
+| LC | Process-global tasks are reference-counted (`acquireGlobals`/`releaseGlobals`), so they survive a reload and stop with the last group. Every `Close` flushes the queue, `Close` is idempotent, and collectors close only with the last group. `InitCollector` closes the collector it replaces, groups fetch the current collector per sample, and `DataCollector.Close` is idempotent. | `TestHuntLCGlobalTasksSurviveConfigReload`, `TestHuntLCEveryCloseFlushesQueuedLearning` |
+| L1 | `PredictWeight` has named results and one `recover` around the whole model path, falling back to the heuristic weight. | `TestPredictWeightFallsBackToHeuristicOnModelPanic` |
+| M1 | `ProbeThrottle.enforceCap`: once a map reaches 2 × 4096 entries, the oldest entries are evicted down to 4096. In-flight or suspected entries count as recent activity. | `TestProbeThrottleHasAHardCap` |
+| W2 | Delay score = `0.3 + 0.5·e^(−ms/scale)·decay`, with scale 400 ms for latency and 600 ms for connect. Same [0.3, 0.8] range, but 30/120/330/1000 ms now score 0.76/0.67/0.52/0.34 instead of a flat 0.8 below about 335 ms. | `TestCalculateWeightDistinguishesLatencyBelow335ms` |
+| W1 | A first-read latency of 0 is "unknown": it gets a neutral 0.55 and no low-latency bonus. It is still scored above a failed connection. A connect time of 0 is unchanged (a real sub-ms dial). | `TestCalculateWeightMissingLatencyIsNotBest` |
+
+Behaviour notes for operators:
+- **W2 changes ranking within the existing range.** Nodes in the 100–400 ms band now differ by up to about 0.15
+  in delay score where they used to tie. Weights of slow nodes drop slightly, so a node already near
+  `AllowedWeight` (0.4) can cross it sooner.
+- **U1 can mark legitimately one-way UDP as failed.** This only affects a session that is ≥ 4 s long and
+  received zero packets, and it is scoped per target. Rare through a proxy, but possible (e.g. syslog
+  forwarding).
+- **R1 leaves one unguarded reader.** The hub `/connections` JSON snapshot reads `SmartBlock` without the
+  lock, as it does for every other field. This is an upstream pattern and outside Smart.

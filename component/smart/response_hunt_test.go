@@ -24,6 +24,7 @@ func TestProbeThrottleHasAHardCap(t *testing.T) {
 	nodes, targets := len(th.nodes), len(th.targets)
 	th.mu.Unlock()
 	limit := 2 * probeMaxEntries
-	knownBug(t, "M1 (probe throttle unbounded within 10 min)", nodes > limit || targets > limit,
-		"after 50k unique targets in 50 s: nodes="+strconv.Itoa(nodes)+" targets="+strconv.Itoa(targets)+" (cap "+strconv.Itoa(probeMaxEntries)+")")
+	if nodes > limit || targets > limit {
+		t.Fatal("regression " + "M1 (probe throttle unbounded within 10 min)" + ": " + "after 50k unique targets in 50 s: nodes=" + strconv.Itoa(nodes) + " targets=" + strconv.Itoa(targets) + " (cap " + strconv.Itoa(probeMaxEntries) + ")")
+	}
 }
