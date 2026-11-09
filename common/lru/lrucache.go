@@ -3,6 +3,7 @@ package lru
 // Modified by https://github.com/die-net/lrucache
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -288,4 +289,76 @@ type entry[K comparable, V any] struct {
 	key     K
 	value   V
 	expires int64
+}
+
+func (c *LruCache[K, V]) FilterByKeyPrefix(prefix string) map[string]V {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := make(map[string]V, len(c.cache))
+	var now int64
+
+	for k, le := range c.cache {
+		keyStr, ok := any(k).(string)
+		if !ok {
+			continue
+		}
+
+		if !strings.HasPrefix(keyStr, prefix) {
+			continue
+		}
+
+		// the clock is only read for a cache that can hold stale entries
+		if !c.staleReturn && c.maxAge > 0 {
+			if now == 0 {
+				now = time.Now().Unix()
+			}
+			if le.Value.expires <= now {
+				c.deleteElement(le)
+				continue
+			}
+		}
+
+		result[keyStr] = le.Value.value
+	}
+
+	c.maybeDeleteOldest()
+
+	return result
+}
+
+func (c *LruCache[K, V]) RemoveByKeyPrefix(prefix string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var removed int
+
+	// an entry may be deleted during the range
+	for k := range c.cache {
+		keyStr, ok := any(k).(string)
+		if !ok || !strings.HasPrefix(keyStr, prefix) {
+			continue
+		}
+
+		c.delete(k)
+		removed++
+	}
+
+	return removed
+}
+
+// SetMaxSize changes the max length of the cache, the entries over the new limit are
+// evicted from the least recently used side. A maxSize of 0 or less means no limit.
+func (c *LruCache[K, V]) SetMaxSize(maxSize int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maxSize = maxSize
+
+	if maxSize <= 0 {
+		return
+	}
+	for c.lru.Len() > maxSize {
+		c.deleteElement(c.lru.Front())
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -68,6 +69,8 @@ var (
 	sniffingEnable    = false
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
+
+	countryCodeRegex = regexp.MustCompile(`(?i)^[A-Z]{2}$`)
 )
 
 type tunnel struct{}
@@ -476,7 +479,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 			}
 			logMetadata(metadata, rule, rawPc)
 
-			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
+			// recover info to dialMetadata for smart
+			dialMetadata.Host = metadata.Host
+
+			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, dialMetadata, rule, 0, 0, true)
 
 			sender.AddMapping(originMetadata, dialMetadata)
 			oAddrPort := dialMetadata.AddrPort()
@@ -612,7 +618,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	logMetadata(metadata, rule, remoteConn)
 
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
+	// recover info to dialMetadata for smart
+	dialMetadata.Host = metadata.Host
+
+	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, dialMetadata, rule, int64(peekLen), 0, true)
 	defer func(remoteConn C.Conn) {
 		_ = remoteConn.Close()
 	}(remoteConn)
@@ -667,8 +676,20 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					continue
 				}
 
+				// set target for Smart gorup nodes selected
+				if smartRuleType(rule.RuleType()) {
+					if rule.RuleType() != C.GEOIP || !countryCodeRegex.MatchString(rule.Payload()) {
+						metadata.SmartTarget = fmt.Sprintf("%s [%s]", rule.RuleType().String(), rule.Payload())
+					}
+				}
+
+				smart := false
+
 				// parse multi-layer nesting
 				for adapter := adapter; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
+					if adapter.Type() == C.Smart {
+						smart = true
+					}
 					if adapter.Type() == C.Pass {
 						log.Debugln("%s match Pass rule", adapter.Name())
 						continue GetRules
@@ -679,6 +700,12 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 						rematchRule = rule
 						break GetRules
 					}
+				}
+
+				if ! smart {
+					metadata.SmartTarget = ""
+				} else {
+					metadata.SmartBlock = "normal"
 				}
 
 				if metadata.NetWork == C.UDP && !adapter.SupportUDP() {
@@ -720,7 +747,7 @@ func getRules(metadata *C.Metadata) []C.Rule {
 	}
 }
 
-func shouldStopRetry(err error) bool {
+func ShouldStopRetry(err error) bool {
 	if errors.Is(err, resolver.ErrIPNotFound) {
 		return true
 	}
@@ -744,7 +771,7 @@ func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe f
 			if fe != nil {
 				fe(err)
 			}
-			if shouldStopRetry(err) {
+			if ShouldStopRetry(err) {
 				return
 			}
 			if s.Wait(ctx) == nil {
@@ -757,4 +784,8 @@ func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe f
 		}
 	}
 	return
+}
+
+func smartRuleType(rt C.RuleType) bool {
+	return C.SmartRuleTypes[rt]
 }

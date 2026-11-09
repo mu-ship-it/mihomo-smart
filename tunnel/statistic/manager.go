@@ -27,6 +27,7 @@ func init() {
 
 type Manager struct {
 	connections   xsync.Map[string, Tracker]
+	smartTarget   xsync.Map[string, *xsync.Map[string, bool]]
 	uploadTemp    atomic.Int64
 	downloadTemp  atomic.Int64
 	uploadBlip    atomic.Int64
@@ -39,10 +40,12 @@ type Manager struct {
 
 func (m *Manager) Join(c Tracker) {
 	m.connections.Store(c.ID(), c)
+	m.joinSmartTarget(c)
 }
 
 func (m *Manager) Leave(c Tracker) {
 	m.connections.Delete(c.ID())
+	m.leaveSmartTarget(c)
 }
 
 func (m *Manager) Get(id string) (c Tracker) {
@@ -127,3 +130,50 @@ type Snapshot struct {
 	Connections   []*TrackerInfo `json:"connections"`
 	Memory        uint64         `json:"memory"`
 }
+
+func (m *Manager) joinSmartTarget(c Tracker) {
+	info := c.Info()
+	target := info.Metadata.SmartTarget
+
+	if target == "" {
+		return
+	}
+
+	id := c.ID()
+
+	result, _ := m.smartTarget.LoadOrStoreFn(target, func() *xsync.Map[string, bool] {
+		return xsync.NewMap[string, bool]()
+	})
+	result.Store(id, true)
+}
+
+func (m *Manager) leaveSmartTarget(c Tracker) {
+	info := c.Info()
+	target := info.Metadata.SmartTarget
+
+	if target == "" {
+		return
+	}
+
+	id := c.ID()
+
+	m.smartTarget.Compute(target, func(result *xsync.Map[string, bool], loaded bool) (*xsync.Map[string, bool], xsync.ComputeOp) {
+		if loaded {
+			result.Delete(id)
+			if result.IsEmpty() {
+				return result, xsync.DeleteOp
+			}
+			return result, xsync.UpdateOp
+		}
+		return result, xsync.CancelOp
+	})
+}
+
+func (m *Manager) RangeSmartTarget(target string, fn func(id string) bool) {
+	if result, ok := m.smartTarget.Load(target); ok {
+		result.Range(func(id string, _ bool) bool {
+			return fn(id)
+		})
+	}
+}
+
