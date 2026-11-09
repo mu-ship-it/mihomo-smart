@@ -1,0 +1,97 @@
+name: Smart CI
+
+# Gate for the mu-ship-it/mihomo-smart fork: vet + tests (incl. -race on the Smart code)
+# and cross-builds for the three platforms we ship. Runs on every push.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: smart-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  SKIP_INTEROP_TEST: 1
+
+jobs:
+  test:
+    name: vet + test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26', '1.27']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - run: go version
+
+      - name: go vet
+        env:
+          CGO_ENABLED: 0
+        run: go vet ./...
+
+      - name: test (all packages)
+        env:
+          CGO_ENABLED: 0
+        run: go test ./... -count=1
+
+      - name: test (all packages, with_gvisor)
+        env:
+          CGO_ENABLED: 0
+        run: go test ./... -count=1 -tags with_gvisor
+
+      - name: test Smart code with race detector (x5)
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -count=5 -v ./adapter/ ./adapter/outboundgroup/ ./component/smart/... 2>&1 | tee race.log; test ${PIPESTATUS[0]} -eq 0
+
+      - name: list known-bug markers still reproducing
+        if: always()
+        run: grep -h "KNOWN BUG" race.log | sort | uniq -c || true
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="smart-${GITHUB_SHA::8}"
+          BUILDTIME="$(date -u)"
+          EXT=""; [ "$GOOS" = windows ] && EXT=".exe"
+          go build -v -tags with_gvisor -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+            -o "dist/mihomo-${GOOS}-${GOARCH}${EXT}" .
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 14

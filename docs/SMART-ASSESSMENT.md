@@ -200,3 +200,33 @@ What would have to change to make this the default:
 - `./mihomo -v` → `Mihomo Meta 1.10.0 darwin arm64 with go1.27.2 unknown time`.
 - `go vet ./component/smart/... ./adapter/outboundgroup/...` → clean.
 - `go test ./component/smart/... ./adapter/outboundgroup/...` → pass (only tcpstats + loadbalance tests exist).
+
+## 9. Phase 2 addendum — test harness and new findings
+
+Base changed: `smart-hardening` is now `v1.19.33` (upstream stable) + one squashed Smart commit
+(`git diff metacubex/Alpha...vernesong/Alpha` at `96feb2a1`, `.github/` excluded). Smart source files are
+byte-identical to `vernesong/Alpha@96feb2a1`, so the line numbers above still hold.
+
+Tests added (all table-driven, fake nodes, no network):
+
+| File | Covers |
+|---|---|
+| `adapter/statustest_test.go` | PR #12 crash class: `StatusTest`, `StatusProbe`, `TargetExitProbe` driven through https→http, cross-host and 3-hop redirects with a recording copy of the `main.go` resolver guard. Verified to FAIL (7/7) when the `DialContext` hook is removed. |
+| `adapter/outboundgroup/smart_test.go` | dial batch bounds, `ParallelDialContext` (winner, failures, all-fail, deadline, no leaked conns), TCP/UDP fail-over through `DialContext`/`ListenPacketContext`, same-node siblings kept, and bug B (cross-node close) for UDP and TCP. |
+| `component/smart/weight_test.go` | min samples, monotonicity (failures, connect, latency, loss, staleness; TCP and UDP), priority scaling, degenerate inputs stay finite, time-decay table, scene table, traffic-factor bounds, known bugs W1/W2. |
+
+`knownBug(...)` markers: a test for a confirmed, unfixed defect skips while the defect reproduces and **fails as
+soon as it stops reproducing**, so the fix must also convert it into a normal assertion. Current markers:
+B-UDP, B-TCP (smart.go:518), W1 (missing measurement = 1 ms), W2 (latency clamp). Each was checked to flip.
+
+New findings while building the harness (confirmed; to be ranked in Phase 3):
+
+- **R1 — data race on `Metadata.SmartBlock`.** `closeSameConnection(force=true)` writes
+  `tracker.Info().Metadata.SmartBlock = "degraded"` (smart.go:2085) on *another* connection's metadata while that
+  connection's close callback reads it (smart.go:1704). Caught by `go test -race` in a cross-node scenario.
+- **R2 — forced close is not scoped to the failing node.** On a confirmed failure (`failedBlock`) the TCP path calls
+  `closeSameConnection(..., force=true)` (smart.go:1638), and with `force` every connection of the target in the
+  group is closed regardless of which node it uses — including UDP flows to the same target key. A dial failure on
+  node B can therefore close healthy connections on node A.
+- **Observation:** a >100 MB stream at >5 MB/min is classified `sceneTransfer`, not `sceneStreaming`, because the
+  transfer check runs first (weight.go:284 vs :290). Documented in the scene test; not yet judged a bug.
