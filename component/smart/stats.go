@@ -66,6 +66,11 @@ type StatsRecord struct {
 	LossRate           float64            `json:"loss_rate,omitempty"`
 	CumulSent          uint64             `json:"cumul_sent,omitempty"`
 	CumulRetrans       uint64             `json:"cumul_retrans,omitempty"`
+	// live UDP quality (EMA over sampled windows and probes); UDPSamples counts the
+	// measurements, so a clean path (loss 0) is told apart from an unmeasured one
+	UDPLoss     float64 `json:"udp_loss,omitempty"`
+	UDPJitterMs float64 `json:"udp_jitter_ms,omitempty"`
+	UDPSamples  int64   `json:"udp_samples,omitempty"`
 }
 
 type NodeState struct {
@@ -95,6 +100,10 @@ type AtomicStatsRecord struct {
 	lossRate        atomic.Float64
 	cumulSent       atomic.Int64
 	cumulRetrans    atomic.Int64
+
+	udpLoss    atomic.Float64
+	udpJitter  atomic.Float64
+	udpSamples atomic.Int64
 
 	weights *lru.LruCache[string, float64]
 }
@@ -216,6 +225,9 @@ func (s *Store) loadAtomicRecord(group, config, target, proxy string) *AtomicSta
 	r.lossRate.Store(existingRecord.LossRate)
 	r.cumulSent.Store(int64(existingRecord.CumulSent))
 	r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
+	r.udpLoss.Store(existingRecord.UDPLoss)
+	r.udpJitter.Store(existingRecord.UDPJitterMs)
+	r.udpSamples.Store(existingRecord.UDPSamples)
 	if existingRecord.Weights != nil {
 		for k, v := range existingRecord.Weights {
 			r.weights.Set(k, v)
@@ -243,6 +255,9 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 		LossRate:           record.lossRate.Load(),
 		CumulSent:          uint64(record.cumulSent.Load()),
 		CumulRetrans:       uint64(record.cumulRetrans.Load()),
+		UDPLoss:            record.udpLoss.Load(),
+		UDPJitterMs:        record.udpJitter.Load(),
+		UDPSamples:         record.udpSamples.Load(),
 		Weights:            record.weights.FilterByKeyPrefix(""),
 	}
 
@@ -353,6 +368,24 @@ func (r *AtomicStatsRecord) Duration() float64 {
 
 func (r *AtomicStatsRecord) SetDuration(v float64) {
 	r.duration.Store(v)
+}
+
+// UDPQuality returns the live UDP loss (0-1) and jitter (ms) and how many measurements fed them.
+func (r *AtomicStatsRecord) UDPQuality() (loss, jitterMs float64, samples int64) {
+	return r.udpLoss.Load(), r.udpJitter.Load(), r.udpSamples.Load()
+}
+
+// AddUDPQuality folds one live window or probe result into the UDP quality EMAs. A negative
+// loss or jitter means that measurement was not taken and leaves the value unchanged.
+func (r *AtomicStatsRecord) AddUDPQuality(loss, jitterMs float64) {
+	had := r.udpSamples.Load() > 0
+	if loss >= 0 {
+		r.udpLoss.Store(UDPQualityEMA(r.udpLoss.Load(), loss, had))
+	}
+	if jitterMs >= 0 {
+		r.udpJitter.Store(UDPQualityEMA(r.udpJitter.Load(), jitterMs, had && r.udpJitter.Load() > 0))
+	}
+	r.udpSamples.Add(1)
 }
 
 func (r *AtomicStatsRecord) LossRate() float64 {

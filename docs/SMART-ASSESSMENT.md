@@ -284,3 +284,177 @@ Behaviour notes for operators:
   forwarding).
 - **R1 leaves one unguarded reader.** The hub `/connections` JSON snapshot reads `SmartBlock` without the
   lock, as it does for every other field. This is an upstream pattern and outside Smart.
+
+## 12. Phase 4 — Zoom-grade UDP scoring and history (design notes for Zoom and Cain)
+
+**Why.** On 11-09 the Zoom call lagged on a node that passed TCP probes. Smart scored UDP from one first-reply latency
+per session and recorded nothing until the session closed (§6), so a call degrading in the middle was invisible to the
+selector. Phase 4 adds three things, each usable on its own: live UDP sampling, an active STUN probe, and a timestamped
+outcome history for a later seasonal model.
+
+### 12.1 What was built
+
+**Live UDP sampling** (`component/smart/udplive.go`, `adapter/outboundgroup/smart_udp.go`)
+- Every UDP session through the group gets a `UDPMeter` on its packet path. The meter counts packets and bytes each
+  way, the longest reply gap, and an RFC 3550-style smoothed inter-arrival jitter. Spacing above 500 ms counts as
+  silence (a muted mic), not jitter.
+- Every `udp-sample-interval` (default 2 s), one goroutine per group cuts every live session into a window:
+  - **Loss** is judged from the window's reply ratio (packets in ÷ packets out) against the best ratio recently seen
+    for the same target on any node of the group (`UDPReplyReference`, bounded at 2048 targets, LRU). If one node
+    answers the same application less often than another, it is losing packets.
+  - A window with fewer than 8 packets sent is not judged.
+  - A session that had replies and now gets none counts as loss 1.
+  - A session that never got any reply is left to the close path (U1), since it may be one-way.
+- Loss and jitter go into EMAs on the node's record for the target (`udp_loss`, `udp_jitter_ms`, `udp_samples`,
+  persisted with the stats).
+- The node's **UDP weight is then recomputed on the spot** (the heuristic score, then the factor below). TCP weight is never touched.
+- The UDP weight is multiplied by
+  `UDPLiveFactor = (1 − 0.6·(1 − e^(−12·loss))) · (1 − 0.3·(1 − e^(−jitter/50 ms)))`:
+  - 2 % loss → ×0.87; 5 % → ×0.73; 10 % → ×0.58; 20 % → ×0.45
+  - 30 ms jitter → ×0.86
+  - floor ×0.28
+- The same factor applies when the session closes, and to the LightGBM path (applied after the model, which does not
+  know these features).
+- Once a node's live loss reaches 10 % or its jitter reaches 60 ms, and it is the target's UDP pin, the pin and the
+  prefetched ranking are dropped. The next UDP flow (including the client's own reconnect) is then placed on the
+  current ranking. A UDP flow cannot be moved while it runs, so this is the make-before-break step from §6.4.
+- Live windows do not change success/failure counts, since a 1-hour call is one session, not 1,800. A target first
+  seen in the open session is scored as if it had the minimum two samples, so it does not wait for its first close.
+
+**Active STUN probe** (`component/smart/stun.go`)
+- Sends RFC 5389 binding requests through one node to a server list:
+  - default `stun.l.google.com:19302` and `stun.cloudflare.com:3478`
+  - 50 packets per second, round robin across the servers
+  - each request has a random transaction id
+- Replies are matched one by one, which gives **real loss**, RTTs (mean and minimum), jitter (mean absolute
+  difference of consecutive RTTs) and the mapped address (the node's public exit).
+- Server names are resolved with mihomo's own resolver, never the system resolver (the PR #12 crash class).
+- Results go through the same `recordUDPQuality` as live windows. Each probe counts as one sample: a success if any
+  reply came back and loss < 50 %. They also update latency.
+- Two entry points:
+  - `POST /group/{name}/probe`: runs the probe across the group's nodes, at most 4 at a time and one probe per group
+    at a time ("pre-meeting warm-up").
+  - **Automatic probing**: every 10 minutes it probes the most recently active UDP target on its best 3 nodes. It is
+    capped by `udp-probe-budget` node probes per clock hour and is **off by default** (budget 0).
+
+**Timestamped history** (`component/smart/history.go`)
+- Every recorded outcome is kept with its timestamp, node, network, ok/failed and the latency, loss and jitter it
+  measured: closed connections (`conn`), live windows (`live`) and probes (`probe`).
+- Storage is one chunk per target and UTC hour (`smart/history/<config>/<group>/<target>/h<unix hour>`) in the
+  existing bbolt store, written through the existing write queue:
+  - each chunk keeps up to 64 raw events plus exact per node and network sums, so a busy hour stays small while its
+    totals stay exact
+  - the current hour is in memory and flushed every minute and on close
+- Retention: chunks older than `history-retention` (default 8 weeks, i.e. two weekly seasons) and, past
+  `history-max-chunks` (default 8192 per group), the oldest hours are pruned hourly.
+- A group flush via the API deletes its history too.
+- `GET /group/{name}/history?target=…[&network=tcp|udp][&node=…][&tz=IANA]` returns per-hour-of-week aggregates:
+  - bucket 0 is Monday 00:00 in `tz`, default the process's zone
+  - per node and network it reports count, successes, failures, success rate, mean latency, loss and jitter
+  - `weeks` is the number of distinct calendar hours behind each bucket
+- There is no prediction yet. This is the input a Holt-Winters fit with a 168-hour season needs.
+
+### 12.2 Knobs and defaults (group options, `type: smart`)
+
+| Option | Default | Meaning |
+|---|---|---|
+| `udp-sample-interval` | `2000` (ms) | Live window length. `-1` turns live sampling off. |
+| `udp-probe-servers` | Google + Cloudflare STUN | `host:port` list for the probe (API and automatic). |
+| `udp-probe-budget` | `0` (off) | Automatic node probes per clock hour. Each probes 3 s at 50 packets/s, about 8 KB each way. |
+| `history-retention` | `1344` (h, 8 weeks) | History age cap. |
+| `history-max-chunks` | `8192` | History chunk cap per group (one chunk = one target-hour, at most ~6 KB). |
+
+Fixed internals worth knowing:
+- minimum 8 packets in a window to judge loss
+- 2 % loss dead zone
+- unpin at 10 % loss or 60 ms jitter
+- at most 1,024 sampled sessions per group (more are scored at close only)
+- at most 1,024 history chunks pending in memory per group
+- probe duration 200 ms to 30 s (default 5 s)
+
+**Cost.** The meter adds about 14 ns and no allocations per packet (`BenchmarkUDPMeterPacket`, M-series Mac), plus
+one clock read. Sampling is one goroutine per group, waking every 2 s. Memory is bounded by the session, reference and
+pending-chunk caps above.
+
+### 12.3 API contracts
+
+`POST /group/{name}/probe`
+- Body: `{"target": "zoom.us" | "<weights key>", "duration": "5s" | "duration_ms": 5000, "servers": [...]?, "nodes": [...]?}`.
+- `target` is the key the weights are stored under. A host is mapped the way a connection to it without a matching
+  rule would be (`zoom.us` → `*.zoom.us`). A key that contains a space or `[` (a rule key) is used as is.
+- Responses:
+  - **200**: `{group, target, duration_ms, servers, results: [{node, sent, received, loss, rtt_ms, min_rtt_ms, jitter_ms, mapped, error?, started_at, weight_before, weight_after, skipped?}]}`
+  - **400**: not a Smart group, bad JSON, no target, bad or out-of-range duration, or no usable STUN server
+  - **404**: unknown group
+  - **409**: a probe is already running
+  - **405**: wrong method
+
+`GET /group/{name}/history`
+- **200**: `{group, target, timezone, utc_offset_minutes, from, to, hours_covered, events, buckets: [{hour_of_week, weekday, hour, weeks, nodes: [{node, network, count, success, failure, success_rate, avg_latency_ms?, avg_loss?, avg_jitter_ms?}]}]}`
+- **400**: missing target, bad network, unknown tz, or not a Smart group
+- **404**: unknown group
+
+### 12.4 Tests (all under `-race` in CI)
+
+- `TestSmartLiveUDPSamplingDemotesLossyNodeWhileCallRuns`:
+  - Two simultaneous calls to `zoom.us` over deterministic fake links, at 200 packets/s with 100 ms sampling. The
+    lossy link drops every 4th reply and swings its delay between 5 and 35 ms every 8 packets.
+  - The lossy node's UDP weight falls below the clean one's within N = 3 s (measured about 0.3 s, i.e. 3 windows).
+  - The clean node leads the UDP ranking, and both TCP weights are bit-identical before and after.
+  - Typical estimates: lossy loss 0.29 (0.25 injected; replies still in flight at a cut push it up), jitter 5.7 ms
+    against 0.2 ms clean.
+- Live-sampling bounds: sampling can be turned off, and sessions are released on close.
+- Probe:
+  - real local STUN server with scripted loss and delay (`component/smart/stuntest`)
+  - a lossy uplink (every 4th request dropped) measures 25 % loss and ends with a lower UDP weight than a clean node
+  - one history event per node
+  - the rejections (no target, duration, servers, busy)
+- `TestSmartAutoProbeStaysWithinHourlyBudget`: budget 2 with 3 nodes → 2 probes, then 0 in the same hour, 2 the next
+  hour, and 0 with the default budget.
+- API contract tests in `hub/route` (DIRECT nodes, local STUN):
+  - every status code above
+  - the report and bucket shapes
+  - the filters
+  - the probe's effect on the selector's ranking
+- Unit tests:
+  - meter counts, cuts, jitter (even spacing ≈ 0; a silence is not jitter), open gaps
+  - reference judging (noise dead zone, outage, one-way)
+  - factor shape
+  - STUN encode and parse (IPv4 and IPv6 XOR-MAPPED-ADDRESS)
+  - history aggregation, time zones, event cap with exact totals, retention and chunk-cap pruning, `/` in target keys
+
+### 12.5 Limits (stated honestly)
+
+- **Loss is relative.** With only one node ever carrying a target, a path that loses from the first packet looks
+  normal to the live estimate; gaps, jitter, the U1 close rule and the probe still see it. Applications with very
+  asymmetric or bursty request/response patterns can show reply-ratio noise; the dead zone and EMA damp it, but it is
+  an estimate, not a sequence-number count.
+- **Jitter is receive-side spacing.** Reordering inside a dense stream does not show; queue build-up (bursts and gaps)
+  does. RTP timestamps would be exact but need parsing the media protocol.
+- **A running UDP flow is not moved.** The group only stops steering new flows to the bad node.
+- The probe measures the path to the STUN servers, not to Zoom's media servers. It is a good proxy for "this node's UDP
+  is healthy right now", not an exact one.
+- History hours are UTC chunks; in a zone with a 30- or 45-minute offset a chunk is filed under the local hour it
+  starts in.
+- Not done from §6: early classification of real-time traffic (§6.6).
+
+### 12.6 How Cain (sing-box) would reuse this
+
+The three pieces are engine-neutral:
+- `udplive.go` (meter, reference, factor) and `stun.go` (probe) depend only on the Go standard library.
+- `history.go` needs only a key-value store with prefix scans.
+
+For Cain:
+1. **Meter:** wrap the `N.PacketConn` that sing-box's `urltest`/selector outbound hands to the router, in the same
+   place Smart wraps it (`WriteTo` = sent, `ReadFrom`/`ReadPacket` = received). Keep it non-replaceable so the
+   zero-copy fast path does not bypass it.
+2. **Scoring:** keep a per (outbound, destination key) UDP score and multiply it by `UDPLiveFactor`. Use the same
+   unpin rule for the outbound chosen for that destination.
+3. **Probe:** call `outbound.ListenPacket` toward the STUN server and run `RunSTUNProbe` over it. On iOS, run it from
+   the Network Extension, inside the extension's memory budget: one probe at a time, at most 30 s.
+   - Expose "warm up before a meeting" as an app action (the equivalent of `POST /probe`).
+   - Run automatic probing only on Wi-Fi or with a small budget.
+4. **History:** store the hour chunks in the app's cache DB with the same retention, and fit the weekly seasonal model
+   on-device or on the Mini later.
+
+The defaults above are the ones to start Cain with.

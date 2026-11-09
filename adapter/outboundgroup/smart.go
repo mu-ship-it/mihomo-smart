@@ -155,6 +155,13 @@ type SmartOption struct {
 	SampleRate     float64 `group:"sample-rate,omitempty"`
 	PreferASN      bool    `group:"prefer-asn,omitempty"`
 	Tolerance      uint16  `group:"tolerance,omitempty"`
+
+	// Phase 4: live UDP quality, active probing, history (docs/SMART-ASSESSMENT.md §12)
+	UDPSampleInterval     int      `group:"udp-sample-interval,omitempty"` // ms; 0 = 2000, < 0 = off
+	UDPProbeServers       []string `group:"udp-probe-servers,omitempty"`   // STUN host:port list
+	UDPProbeBudget        int      `group:"udp-probe-budget,omitempty"`    // automatic node probes per hour; 0 = off
+	HistoryRetentionHours int      `group:"history-retention,omitempty"`   // hours; 0 = 8 weeks
+	HistoryMaxChunks      int      `group:"history-max-chunks,omitempty"`  // per group; 0 = 8192
 }
 
 type Smart struct {
@@ -198,6 +205,16 @@ type Smart struct {
 	lossSampler   *tcpstats.LossSampler
 
 	exitWatch *smart.ExitWatcher
+
+	// Phase 4: live UDP quality, active probing, history
+	udpSampleInterval time.Duration
+	udpProbeServers   []string
+	udpLiveMu         sync.Mutex
+	udpLive           map[*udpLiveSession]struct{}
+	udpRef            *smart.UDPReplyReference
+	history           *smart.HistoryRecorder
+	probeRunning      atomic.Bool
+	autoProbe         probeBudget
 
 	closed atomic.Bool
 }
@@ -291,6 +308,8 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	}
 
 	s.InitSmart()
+	s.initUDPQuality(smartOption)
+	s.startUDPQuality()
 
 	return s, nil
 }
@@ -673,8 +692,9 @@ func (s *Smart) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, metadat
 	pc = callback.NewFirstReadCallBackPacketConn(pc, func(latency int64) {
 		udpLatency.Store(latency)
 	})
+	pc, live := s.startLiveUDP(pc, proxy, metadata)
 
-	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency, &observedReadErr, &observedWriteErr)
+	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency, &observedReadErr, &observedWriteErr, live)
 }
 
 func (s *Smart) Set(name string) error {
@@ -1655,6 +1675,12 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	} else {
 		calculatedWeight, ModelPredicted = smart.CalculateWeight(input, priorityFactor)
 	}
+	// the measured loss and jitter of the node's live UDP sessions and probes (Phase 4)
+	if isUDP {
+		if udpLoss, udpJitter, n := atomicRecord.UDPQuality(); n > 0 {
+			calculatedWeight *= smart.UDPLiveFactor(udpLoss, udpJitter)
+		}
+	}
 
 	// a pinned group and a force-closed connection never reach the host checks, so their
 	// snapshot is not read at all
@@ -1706,6 +1732,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	s.saveStatsRecord(target, proxy, statsSnapshot)
+	s.recordHistory(metadata, proxyName, latency, err)
 
 	if s.collectData {
 		collectedWeight := adjWeight / priorityFactor
@@ -1776,8 +1803,9 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 	})
 }
 
-func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64, observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error]) C.PacketConn {
+func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64, observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], live *udpLiveSession) C.PacketConn {
 	return callback.NewCloseCallbackPacketConn(pc, func() {
+		s.stopLiveUDP(live)
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
 			info := tracker.Info()
@@ -2632,6 +2660,7 @@ func (s *Smart) Close() error {
 	s.wg.Wait()
 
 	// every close persists the queued learning, not only the first one in the process
+	s.history.Flush()
 	s.store.FlushQueue(true)
 
 	releaseGlobals(s.store)

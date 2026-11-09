@@ -2,6 +2,9 @@ package route
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -29,6 +32,8 @@ func groupRouter() http.Handler {
 		r.Get("/", getGroup)
 		r.Get("/delay", getGroupDelay)
 		r.Get("/weights", getGroupWeights)
+		r.Post("/probe", postGroupProbe)
+		r.Get("/history", getGroupHistory)
 	})
 	return r
 }
@@ -164,9 +169,9 @@ func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
 	errorsMap := make(map[string]string)
 
 	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		sem   = make(chan struct{}, 5)
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 5)
 	)
 
 	for _, p := range tunnel.Proxies() {
@@ -210,4 +215,121 @@ func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
 		"weights": result,
 		"errors":  errorsMap,
 	})
+}
+
+// smartGroupOf returns the request's group as a Smart group, writing a 400 when it is not one.
+func smartGroupOf(w http.ResponseWriter, r *http.Request) (*outboundgroup.Smart, bool) {
+	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
+	sg, ok := proxy.Adapter().(*outboundgroup.Smart)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("not a Smart group"))
+		return nil, false
+	}
+	return sg, true
+}
+
+// probeRequest is the body of POST /group/{name}/probe.
+type probeRequest struct {
+	Target     string   `json:"target"`
+	Duration   string   `json:"duration,omitempty"`    // Go duration, e.g. "5s"
+	DurationMs int64    `json:"duration_ms,omitempty"` // alternative to duration
+	Servers    []string `json:"servers,omitempty"`     // STUN host:port; default: the group's list
+	Nodes      []string `json:"nodes,omitempty"`       // default: every UDP capable node
+}
+
+// postGroupProbe runs a STUN probe through a Smart group's nodes and writes the results into
+// the target's UDP weights ("pre-meeting warm-up").
+func postGroupProbe(w http.ResponseWriter, r *http.Request) {
+	sg, ok := smartGroupOf(w, r)
+	if !ok {
+		return
+	}
+	var req probeRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, ErrBadRequest)
+		return
+	}
+	var duration time.Duration
+	switch {
+	case req.Duration != "":
+		d, err := time.ParseDuration(req.Duration)
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("invalid duration"))
+			return
+		}
+		duration = d
+	case req.DurationMs != 0:
+		duration = time.Duration(req.DurationMs) * time.Millisecond
+	}
+
+	// the probe outlives the reply wait of its last packet, so give it room beyond its length
+	budget := duration
+	if budget == 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), budget+15*time.Second)
+	defer cancel()
+
+	report, err := sg.ProbeUDP(ctx, outboundgroup.UDPProbeRequest{
+		Target:   req.Target,
+		Duration: duration,
+		Servers:  req.Servers,
+		Nodes:    req.Nodes,
+	})
+	switch {
+	case err == nil:
+		render.JSON(w, r, report)
+	case errors.Is(err, outboundgroup.ErrProbeBusy):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, newError(err.Error()))
+	case errors.Is(err, outboundgroup.ErrProbeNoTarget), errors.Is(err, outboundgroup.ErrProbeDuration), errors.Is(err, outboundgroup.ErrProbeNoServers):
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError(err.Error()))
+	default:
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, newError(err.Error()))
+	}
+}
+
+// getGroupHistory returns a Smart group's recorded outcomes for one target, aggregated per
+// hour of the week. Query: target (required), network (tcp|udp), node, tz (IANA name; default
+// the process's local zone).
+func getGroupHistory(w http.ResponseWriter, r *http.Request) {
+	sg, ok := smartGroupOf(w, r)
+	if !ok {
+		return
+	}
+	query := r.URL.Query()
+	target := query.Get("target")
+	if target == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("target is required"))
+		return
+	}
+	network := query.Get("network")
+	if network != "" && network != smart.HistoryNetworkTCP && network != smart.HistoryNetworkUDP {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("network must be tcp or udp"))
+		return
+	}
+	loc := time.Local
+	if tz := query.Get("tz"); tz != "" {
+		l, err := time.LoadLocation(tz)
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("unknown time zone"))
+			return
+		}
+		loc = l
+	}
+	h := sg.History()
+	if h == nil {
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, newError("history not available"))
+		return
+	}
+	render.JSON(w, r, h.Report(sg.ProbeTargetKey(target), network, query.Get("node"), loc))
 }

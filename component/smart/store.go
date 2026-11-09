@@ -22,6 +22,7 @@ const (
 	OpSaveRanking
 	OpSaveHostFailures
 	OpDeleteData
+	OpSaveHistory
 )
 
 const (
@@ -131,6 +132,8 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
 	case OpSaveHostFailures:
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+	case OpSaveHistory:
+		return FormatDBKey(KeyTypeHistory, op.Config, op.Group, op.Target, op.Node)
 	case OpDeleteData:
 		kt := op.KeyType
 		if kt == "" {
@@ -342,6 +345,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config),
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
+			FormatDBKey(KeyTypeHistory, config),
 		}, false)
 	case "group":
 		s.DBBatchDeletePrefix([]string{
@@ -350,6 +354,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config, group),
 			FormatDBKey(KeyTypePrefetch, config, group),
 			FormatDBKey(KeyTypeHostFailures, config, group),
+			FormatDBKey(KeyTypeHistory, config, group) + "/",
 		}, false)
 	}
 

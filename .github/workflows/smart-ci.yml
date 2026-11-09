@@ -53,7 +53,7 @@ jobs:
       - name: test Smart code with race detector (x5)
         env:
           CGO_ENABLED: 1
-        run: go test -race -count=5 -v ./adapter/ ./adapter/outboundgroup/ ./component/smart/... 2>&1 | tee race.log; test ${PIPESTATUS[0]} -eq 0
+        run: go test -race -count=5 -v ./adapter/ ./adapter/outboundgroup/ ./component/smart/... ./hub/route/ 2>&1 | tee race.log; test ${PIPESTATUS[0]} -eq 0
 
       - name: list known-bug markers still reproducing
         if: always()
