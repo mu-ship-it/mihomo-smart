@@ -1,0 +1,22 @@
+[Unit]
+Description=Soak test load generator (Phase 5; remove with /opt/soak/remove.sh)
+After=smart-soak.service stock-soak.service
+
+[Service]
+Type=simple
+ExecStart=/opt/soak/bin/soak run -config /opt/soak/loadgen.json
+Restart=on-failure
+RestartSec=30
+CPUQuota=15%
+MemoryMax=200M
+Nice=10
+IOSchedulingClass=idle
+IPAccounting=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/soak
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=Soak test @NAME@ mihomo (Phase 5, loopback only; remove with /opt/soak/remove.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/soak/bin/mihomo-@NAME@ -d /opt/soak/@NAME@ -f /opt/soak/@NAME@/config.yaml
+Restart=on-failure
+RestartSec=10
+CPUQuota=15%
+MemoryMax=200M
+Nice=10
+IOSchedulingClass=idle
+IPAccounting=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/soak/@NAME@
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# Soak instance @NAME@ (Phase 5). Loopback only: no TUN, no system proxy, no DNS server.
+mixed-port: @MIXED@
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: warning
+external-controller: 127.0.0.1:@CTL@
+secret: "@SECRET@"
+geo-auto-update: false
+profile:
+  store-selected: false
+dns:
+  enable: false
+proxy-providers:
+  kycloud:
+    # fetched once by setup.sh; the instances never see the subscription URL (mihomo logs
+    # provider URLs on fetch errors)
+    type: file
+    path: ./providers/kycloud.yaml
+    filter: "专线|HKBN|台湾"
+    exclude-filter: "剩余|套餐|到期"
+proxy-groups:
+  - name: Soak
+    type: @GROUPTYPE@
+    use: [kycloud]
+    url: https://www.gstatic.com/generate_204
+    interval: 600
+rules:
+  - MATCH,Soak
